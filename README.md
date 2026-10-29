@@ -3,8 +3,9 @@
 ## Русский
 
 `ROUTER` — FastAPI-приложение, которое маршрутизирует запросы к нескольким
-llama.cpp-серверам. Версия **1.1.0** добавляет пулы embedding-моделей с
-балансировкой, circuit breaker и прозрачным fallback внутри пула.
+llama.cpp-серверам. Версия **1.2.0** добавляет управление пулами и их
+участниками из админ-панели; сами пулы embedding-моделей появились в 1.1.0
+(балансировка, circuit breaker и прозрачный fallback внутри пула).
 
 ### Архитектура
 
@@ -40,15 +41,35 @@ llama.cpp-серверам. Версия **1.1.0** добавляет пулы e
 
 ### Запуск
 
+Приложение собирается в собственный образ `llama-router:1.2.0` (multi-stage
+`Dockerfile`, зависимости из `requirements.txt` ставятся на этапе сборки).
+Код запечён в образ, снаружи монтируются только конфиги.
+
 ```bash
 cd ROUTER
+docker compose build
 docker compose up -d
 curl -s http://127.0.0.1/health | python3 -m json.tool
 ```
 
-Контейнер монтирует `./` как `/app`, поэтому новые файлы (`embedding_pool.py`,
-`embedding_pools.json`) видны после перезапуска контейнера. Новых pip-зависимостей
-нет. Версия приложения отображается в `GET /health` (`"version": "1.1.0"`).
+- Прод: сервис `router`, контейнер `llama-router`, порт `:80`.
+- Canary: `docker compose --profile canary up -d router-canary` — тот же образ
+  на `:8080` с read-only конфигами; после проверок
+  `docker compose --profile canary rm -sf router-canary`.
+- Тесты: `docker compose --profile test run --rm --build router-test` — pytest
+  на моках внутри финального образа, без обращений к боевым бэкендам.
+
+Монтируются только `backends.json` и `embedding_pools.json` (long syntax,
+`create_host_path: false`); `.env` передаётся через `env_file` и в образ не
+попадает. Если конфигов нет на хосте, `docker compose up` падает с явной
+ошибкой вместо создания каталога на месте файла; без смонтированного
+`embedding_pools.json` само приложение стартует без пулов с предупреждением в
+логе. Изменения кода требуют пересборки образа
+(`docker compose build && docker compose up -d`). `backends.json` и
+`embedding_pools.json` пишутся из admin API атомарно; при single-file bind mount
+`os.replace` с `EBUSY` откатывается на запись in-place.
+
+Версия приложения отображается в `GET /health` (`"version": "1.2.0"`).
 
 ### Файлы конфигурации
 
@@ -217,6 +238,28 @@ curl -s http://127.0.0.1/admin/api/embedding/pools \
 curl -s -X POST http://127.0.0.1/admin/api/embedding/pools/reload \
   -H "Authorization: Bearer $API_KEY"
 
+# Создать пул (без участников или с первым участником)
+curl -s -X POST http://127.0.0.1/admin/api/embedding/pools \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"embed-4","embedding_model":"test-embed","dimensions":4,
+       "members":[{"backend":"llama-embedded","model":"test-embed-q8","weight":1,"role":"active"}]}'
+
+# Добавить участника в существующий пул
+curl -s -X POST http://127.0.0.1/admin/api/embedding/pools/embed-768/members \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"backend":"llama-embedded-2","model":"nomic-embed-text-v1.5-Q8_0","weight":1,"role":"active"}'
+
+# Изменить weight/role/model участника
+curl -s -X PUT http://127.0.0.1/admin/api/embedding/pools/embed-768/members/llama-embedded-2 \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"weight":3,"role":"backup"}'
+
+# Удалить участника и пул
+curl -s -X DELETE http://127.0.0.1/admin/api/embedding/pools/embed-768/members/llama-embedded-2 \
+  -H "Authorization: Bearer $API_KEY"
+curl -s -X DELETE http://127.0.0.1/admin/api/embedding/pools/embed-768 \
+  -H "Authorization: Bearer $API_KEY"
+
 # Закрыть breaker участника вручную
 curl -s -X POST \
   http://127.0.0.1/admin/api/embedding/pools/embed-768/members/llama-embedded/reset \
@@ -230,6 +273,56 @@ curl -s http://127.0.0.1/health
 `consecutive_failures`, `open_for_seconds`, `probe_inflight`,
 `total_requests`, `total_failures`, `last_error`, `cache_hint`,
 `url`. `rejected` содержит отброшенных участников с причиной.
+
+### Секция «Embedding-пулы» в админ-панели
+
+`http://<router>/admin` содержит карточку «Embedding-пулы» под списком
+бэкендов. Состояние читается с admin API, а пулы и участники управляются прямо
+из панели: изменения пишутся в `embedding_pools.json` и сразу применяются
+(менеджер перечитывает конфиг).
+
+Что показывает карточка:
+
+- по каждому пулу — имя, `embedding_model`, `dimensions`, число healthy
+  участников, число открытых breaker'ов и пометку `disabled` с причиной;
+- таблицу участников: backend, URL, model, role, weight, состояние breaker
+  (`closed` — зелёный, `open` — красный, `half_open` — оранжевый),
+  `consecutive_failures`, `total_requests`/`total_failures`, `last_error`;
+- отброшенные при загрузке участники с причинами (`unknown_backend`,
+  `model_mismatch`, `duplicate_backend` и т.п.);
+- значение `default_pool`.
+
+Кнопки и формы:
+
+- «Добавить пул» — имя, `embedding_model`, `dimensions` и необязательный первый
+  участник; создаётся `POST /admin/api/embedding/pools`;
+- «Добавить участника» в карточке пула — выбор бэкенда из `backends.json`,
+  модель, weight и role; `POST
+  /admin/api/embedding/pools/{pool}/members`;
+- «×» в строке участника — удаление из пула, `DELETE
+  /admin/api/embedding/pools/{pool}/members/{backend}`;
+- «Удалить пул» — удаление пула целиком, `DELETE
+  /admin/api/embedding/pools/{pool}`;
+- «Перезагрузить конфиг» — `POST /admin/api/embedding/pools/reload`;
+- «Сбросить» в строке участника — `POST
+  /admin/api/embedding/pools/{pool}/members/{backend}/reset` (закрывает
+  breaker).
+
+Валидация выполняется до записи: имя пула по тем же правилам, что имя бэкенда;
+бэкенд должен существовать в `backends.json`; модель участника должна быть
+совместима с `embedding_model` пула (нормализация точек и префиксное сравнение);
+`weight` — целое > 0; `role` — `active` или `backup`. Ошибки показываются в
+форме, конфиг при этом не меняется.
+
+Запись `embedding_pools.json` атомарная (`.tmp` + `fsync` + `os.replace`), при
+single-file bind mount и `EBUSY` используется запись in-place — как у
+`backends.json`.
+
+Секция обновляется каждые 10 секунд независимо от списка бэкендов (общий
+30-секундный цикл не менялся), приостанавливает автообновление, когда вкладка
+скрыта или открыта форма редактирования. Если новый admin API недоступен
+(например, панель открыта у старой версии роутера), ошибка показывается внутри
+карточки и не влияет на остальные секции.
 
 ### Примеры
 
@@ -276,8 +369,9 @@ tar czf ../ROUTER_backup_$(date +%Y%m%d-%H%M%S).tar.gz -C .. ROUTER
 ## English
 
 `ROUTER` is a FastAPI application that routes requests to multiple llama.cpp
-servers. Version **1.1.0** adds embedding model pools with load balancing,
-circuit breakers and transparent in-pool fallback.
+servers. Version **1.2.0** adds pool and member management to the admin panel;
+the embedding model pools themselves arrived in 1.1.0 (load balancing, circuit
+breakers and transparent in-pool fallback).
 
 ### Architecture
 
@@ -313,16 +407,36 @@ and is never returned to the client.
 
 ### Running
 
+The application is built into its own `llama-router:1.2.0` image (multi-stage
+`Dockerfile`, dependencies from `requirements.txt` installed at build time).
+The code is baked into the image; only configuration is mounted from the host.
+
 ```bash
 cd ROUTER
+docker compose build
 docker compose up -d
 curl -s http://127.0.0.1/health | python3 -m json.tool
 ```
 
-The container mounts `./` as `/app`, so new files (`embedding_pool.py`,
-`embedding_pools.json`) are visible after a container restart. No new pip
-dependencies are required. The application version is exposed by
-`GET /health` (`"version": "1.1.0"`).
+- Production: service `router`, container `llama-router`, port `:80`.
+- Canary: `docker compose --profile canary up -d router-canary` — the same
+  image on `:8080` with read-only configs; afterwards
+  `docker compose --profile canary rm -sf router-canary`.
+- Tests: `docker compose --profile test run --rm --build router-test` —
+  mocked pytest inside the final image, no calls to live backends.
+
+Only `backends.json` and `embedding_pools.json` are mounted (long syntax,
+`create_host_path: false`); `.env` is passed via `env_file` and never enters the
+image. If a config file is missing on the host, `docker compose up` fails with an
+explicit error instead of creating a directory in its place; without a mounted
+`embedding_pools.json` the application itself starts without pools and logs a
+warning. Code changes require a rebuild
+(`docker compose build && docker compose up -d`). Both `backends.json` and
+`embedding_pools.json` are written atomically from the admin API; on a
+single-file bind mount an `EBUSY` on `os.replace` falls back to an in-place
+write.
+
+The application version is exposed by `GET /health` (`"version": "1.2.0"`).
 
 ### Configuration files
 
@@ -438,10 +552,58 @@ in the Russian section:
 
 - `GET /admin/api/embedding/pools` — full status (members, breakers, counters,
   rejected members, cache hints);
+- `POST /admin/api/embedding/pools` — create a pool (optionally with the first
+  member);
+- `DELETE /admin/api/embedding/pools/{pool}` — delete a pool;
+- `POST /admin/api/embedding/pools/{pool}/members` — add a member;
+- `PUT /admin/api/embedding/pools/{pool}/members/{backend}` — update
+  model/weight/role;
+- `DELETE /admin/api/embedding/pools/{pool}/members/{backend}` — remove a member;
 - `POST /admin/api/embedding/pools/reload` — force reload;
 - `POST /admin/api/embedding/pools/{pool}/members/{backend}/reset` — close a
   breaker manually;
 - `GET /health` — pool summary and `version`.
+
+The write endpoints persist the config atomically (with an in-place fallback when
+the single-file bind mount returns `EBUSY`) and reload the manager immediately.
+Invalid input is rejected before writing: unknown backends, incompatible member
+models, duplicate members, bad weights/roles and invalid pool names.
+
+### “Embedding pools” section in the admin panel
+
+`http://<router>/admin` has an “Embedding pools” card below the backend list.
+Status comes from the admin API, and pools/members are managed directly in the
+panel: changes are written to `embedding_pools.json` and applied immediately (the
+manager reloads the config).
+
+The card shows, per pool: name, `embedding_model`, `dimensions`, healthy member
+count, open breaker count and a `disabled` marker with its reason. The member
+table lists backend, URL, model, role, weight, breaker state (`closed` — green,
+`open` — red, `half_open` — amber), `consecutive_failures`,
+`total_requests`/`total_failures` and `last_error`. Members rejected at load time
+are listed with their reasons (`unknown_backend`, `model_mismatch`,
+`duplicate_backend`, etc.). The card also shows `default_pool`.
+
+Controls: “Add pool” (name, `embedding_model`, `dimensions` and an optional first
+member), “Add member” inside a pool card (backend from `backends.json`, model,
+weight, role), “×” to remove a member, “Delete pool”, “Reload config” and
+“Reset” to close a member breaker.
+
+Input is validated before writing: pool names follow the backend-name rules, the
+backend must exist in `backends.json`, the member model must be compatible with
+the pool `embedding_model` (dot normalization and prefix matching), `weight` must
+be a positive integer and `role` must be `active` or `backup`. Errors are shown
+in the form and the config stays unchanged.
+
+`embedding_pools.json` writes are atomic (`.tmp` + `fsync` + `os.replace`) with an
+in-place fallback for a single-file bind mount returning `EBUSY`, like
+`backends.json`.
+
+The section refreshes every 10 seconds with its own timer (the existing 30-second
+backend refresh cycle is unchanged) and pauses while the tab is hidden or an edit
+form is open. If the new admin API is unavailable (for example, the panel is
+served by an older router), the error is shown inside the card and the other
+sections keep working.
 
 ### Examples and tests
 

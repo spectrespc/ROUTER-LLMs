@@ -1,20 +1,68 @@
 services:
   router:
-    image: python:3.12-slim
+    build: { context: ., target: prod }
+    image: llama-router:1.2.0
     container_name: llama-router
     ports:
       - "80:80"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
-      - ./:/app
+      - type: bind
+        source: ./backends.json
+        target: /app/backends.json
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./embedding_pools.json
+        target: /app/embedding_pools.json
+        bind:
+          create_host_path: false
     env_file:
       - .env
-    working_dir: /app
-    environment:
-      - API_KEY=${API_KEY}
-    command: >
-      bash -c "pip install --no-cache-dir fastapi==0.143.3 uvicorn==0.54.0 httpx==0.28.1 python-dotenv==1.2.4 jinja2==3.1.6 &&
-               uvicorn router:app --host 0.0.0.0 --port 80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  router-canary:
+    profiles: ["canary"]
+    build: { context: ., target: prod }
+    image: llama-router:1.2.0
+    container_name: llama-router-canary
+    ports:
+      - "8080:80"
+    volumes:
+      - type: bind
+        source: ./backends.json
+        target: /app/backends.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./embedding_pools.json
+        target: /app/embedding_pools.json
+        read_only: true
+        bind:
+          create_host_path: false
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+  router-test:
+    profiles: ["test"]
+    build: { context: ., target: test }
+    volumes:
+      - type: bind
+        source: ./backends.json
+        target: /app/backends.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./embedding_pools.json
+        target: /app/embedding_pools.json
+        read_only: true
+        bind:
+          create_host_path: false
+    env_file:
+      - .env

@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets — never bake .env into the image
+.env
+.env.*
+
+# Local backups / editor artifacts
+*.save
+*.tmp
+*.corrupt
+*.bak
+*~
+
+# Non-runtime content
+examples/
+README.md
+CHANGELOG.md
+.git/
+.gitignore
+docker-compose.yml
+Dockerfile
+.dockerignore

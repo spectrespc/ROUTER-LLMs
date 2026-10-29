@@ -129,6 +129,75 @@
     .status.offline { color: var(--offline); }
     .backend-error { color: var(--warning); font-size: .85rem; }
 
+    /* Embedding pools (additive section) */
+    .pool-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+    .pool-summary { color: #9fb0d0; font-size: .9rem; }
+    .pool {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 14px 16px;
+        margin-bottom: 16px;
+        background: var(--bg);
+    }
+    .pool:last-child { margin-bottom: 0; }
+    .pool-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 10px;
+        margin-bottom: 8px;
+    }
+    .pool-name { font-weight: 600; font-size: 1.02rem; }
+    .pool-meta { color: #9fb0d0; font-size: .85rem; }
+    .pool-disabled { color: var(--offline); font-weight: 600; font-size: .85rem; }
+    .breaker { font-weight: 600; white-space: nowrap; }
+    .breaker.closed { color: var(--online); }
+    .breaker.open { color: var(--offline); }
+    .breaker.half_open { color: var(--warning); }
+    .pool-table { min-width: 900px; }
+    .pool-table td, .pool-table th { font-size: .88rem; padding: 8px 10px; }
+    .pool-rejections {
+        margin: 10px 0 0;
+        padding-left: 18px;
+        color: var(--warning);
+        font-size: .85rem;
+    }
+    .pool-empty { color: #9fb0d0; margin: 0; }
+    .pool-form {
+        border: 1px dashed var(--border);
+        border-radius: 6px;
+        padding: 12px;
+        margin-bottom: 16px;
+    }
+    .pool-form-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+    .pool-form-row input,
+    .pool-form-row select {
+        font: inherit;
+        color: var(--text);
+        background: var(--input);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 10px;
+        flex: 1 1 180px;
+        min-width: 120px;
+    }
+    .pool-form-row input.pool-small { flex: 0 0 90px; }
+    .pool-form-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pool-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .pool-member-form { margin: 12px 0 0; }
+    .pool-member-form[hidden], .pool-form[hidden] { display: none; }
+
     #backend-count { color: #9fb0d0; font-size: 1rem; font-weight: 400; }
 
     #toast-container {
@@ -208,6 +277,43 @@
             </div>
             <p id="list-error" class="error" hidden></p>
         </section>
+
+        <section id="pool-section" class="card">
+            <h2>Embedding-пулы</h2>
+            <div class="pool-toolbar">
+                <button id="pool-reload-btn" class="secondary">Перезагрузить конфиг</button>
+                <button id="pool-create-btn" class="secondary">Добавить пул</button>
+                <span id="pool-summary" class="pool-summary"></span>
+            </div>
+
+            <form id="pool-create-form" class="pool-form" hidden>
+                <div class="pool-form-row">
+                    <input id="pool-new-name" placeholder="Имя пула (напр. embed-1024)" required>
+                    <input id="pool-new-model" placeholder="Embedding-модель (напр. bge-m3)" required>
+                    <input id="pool-new-dims" type="number" min="1" placeholder="Размерность (напр. 1024)" required>
+                </div>
+                <div class="pool-form-row">
+                    <select id="pool-new-backend">
+                        <option value="">Первый участник: бэкенд (необязательно)</option>
+                    </select>
+                    <input id="pool-new-member-model" placeholder="Модель участника" list="pool-model-options">
+                    <input id="pool-new-weight" class="pool-small" type="number" min="1" value="1" title="Вес SWRR">
+                    <select id="pool-new-role">
+                        <option value="active">active</option>
+                        <option value="backup">backup</option>
+                    </select>
+                </div>
+                <div class="pool-form-actions">
+                    <button type="submit">Создать пул</button>
+                    <button type="button" id="pool-create-cancel" class="secondary">Отмена</button>
+                </div>
+                <p id="pool-create-error" class="error" hidden></p>
+            </form>
+            <datalist id="pool-model-options"></datalist>
+
+            <div id="pools-container"></div>
+            <p id="pool-error" class="error" hidden></p>
+        </section>
     </div>
 
 </div>
@@ -223,6 +329,14 @@
 
     let apiKey = localStorage.getItem('admin_api_key') || '';
     let autoRefreshTimer = null;
+    let poolRefreshTimer = null;
+    let backendCatalog = [];
+
+    const BREAKER_LABELS = {
+        closed: '● closed',
+        open: '● open',
+        half_open: '● half-open'
+    };
 
     async function authRequest(url, options) {
         const opts = Object.assign({}, options);
@@ -273,7 +387,12 @@
                 clearInterval(autoRefreshTimer);
             }
             autoRefreshTimer = setInterval(loadBackends, 30000);
+            if (poolRefreshTimer) {
+                clearInterval(poolRefreshTimer);
+            }
+            poolRefreshTimer = setInterval(loadPools, 10000);
             await loadBackends();
+            await loadPools();
         } catch (e) {
             if (isUnauthorized(e)) {
                 $('login-error').hidden = false;
@@ -292,12 +411,22 @@
             clearInterval(autoRefreshTimer);
             autoRefreshTimer = null;
         }
+        if (poolRefreshTimer) {
+            clearInterval(poolRefreshTimer);
+            poolRefreshTimer = null;
+        }
         const loginSection = $('login-section');
         const adminContent = $('admin-content');
         if (loginSection) loginSection.hidden = false;
         if (adminContent) adminContent.hidden = true;
         const tbody = $('backends-tbody');
         if (tbody) tbody.replaceChildren();
+        const poolsContainer = $('pools-container');
+        if (poolsContainer) poolsContainer.replaceChildren();
+        const poolSummary = $('pool-summary');
+        if (poolSummary) poolSummary.textContent = '';
+        const poolCreateForm = $('pool-create-form');
+        if (poolCreateForm) poolCreateForm.hidden = true;
         const input = $('api-key-input');
         if (input) input.value = '';
     }
@@ -311,6 +440,8 @@
     function renderBackends(backends) {
         const tbody = $('backends-tbody');
         tbody.replaceChildren();
+        backendCatalog = Array.isArray(backends) ? backends : [];
+        updateModelOptions();
         $('backend-count').textContent = '(' + backends.length + ')';
 
         for (const b of backends) {
@@ -460,6 +591,547 @@
         }
     }
 
+    async function responseDetail(resp, fallback) {
+        try {
+            const data = await resp.json();
+            if (data && data.detail) {
+                return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+            }
+        } catch (e) { /* ignore */ }
+        return fallback + ' (HTTP ' + resp.status + ')';
+    }
+
+    function updateModelOptions() {
+        const datalist = $('pool-model-options');
+        if (!datalist) {
+            return;
+        }
+        const seen = new Set();
+        datalist.replaceChildren();
+        for (const backend of backendCatalog) {
+            for (const modelId of (backend.models || [])) {
+                const name = String(modelId).split('@')[0];
+                if (!name || seen.has(name)) {
+                    continue;
+                }
+                seen.add(name);
+                const option = document.createElement('option');
+                option.value = name;
+                datalist.appendChild(option);
+            }
+        }
+    }
+
+    function fillBackendSelect(select, names, placeholder) {
+        select.replaceChildren();
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = placeholder;
+        select.appendChild(empty);
+        for (const name of names) {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            select.appendChild(option);
+        }
+    }
+
+    function poolFormActive() {
+        const createForm = $('pool-create-form');
+        if (createForm && !createForm.hidden) {
+            return true;
+        }
+        return Array.from(document.querySelectorAll('.pool-member-form'))
+            .some((form) => !form.hidden);
+    }
+
+    function makeBreakerSpan(state) {
+        const span = document.createElement('span');
+        const known = Object.prototype.hasOwnProperty.call(BREAKER_LABELS, state);
+        span.className = 'breaker' + (known ? ' ' + state : '');
+        span.textContent = known ? BREAKER_LABELS[state] : ('● ' + String(state || 'unknown'));
+        return span;
+    }
+
+    function renderPoolMember(pool, member) {
+        const tr = document.createElement('tr');
+        tr.appendChild(makeCellText(member.backend));
+
+        const urlTd = document.createElement('td');
+        const urlText = String(member.url || '—');
+        const urlSpan = document.createElement('span');
+        urlSpan.textContent = urlText.length > 50 ? urlText.slice(0, 47) + '...' : urlText;
+        urlSpan.title = urlText;
+        urlTd.appendChild(urlSpan);
+        tr.appendChild(urlTd);
+
+        tr.appendChild(makeCellText(member.model));
+        tr.appendChild(makeCellText(member.role));
+        tr.appendChild(makeCellText(String(member.weight)));
+
+        const breakerTd = document.createElement('td');
+        breakerTd.appendChild(makeBreakerSpan(member.breaker));
+        tr.appendChild(breakerTd);
+
+        tr.appendChild(makeCellText(String(member.consecutive_failures)));
+        tr.appendChild(makeCellText(String(member.total_requests) + ' / ' + String(member.total_failures)));
+        tr.appendChild(makeCellText(member.last_error || '—'));
+
+        const actionTd = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.className = 'secondary';
+        btn.textContent = 'Сбросить';
+        btn.title = 'Сбросить circuit breaker участника';
+        btn.addEventListener('click', () => resetPoolMember(pool.name, member.backend));
+        actionTd.appendChild(btn);
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'remove-btn';
+        delBtn.textContent = '×';
+        delBtn.title = 'Удалить участника из пула';
+        delBtn.addEventListener('click', () => removePoolMember(pool.name, member.backend));
+        actionTd.appendChild(delBtn);
+
+        tr.appendChild(actionTd);
+
+        return tr;
+    }
+
+    function renderPools(pools, status) {
+        const container = $('pools-container');
+        container.replaceChildren();
+
+        const summary = $('pool-summary');
+        if (status && status.default_pool) {
+            summary.textContent = 'default_pool: ' + status.default_pool;
+        } else {
+            summary.textContent = 'default_pool не задан';
+        }
+
+        if (!pools.length) {
+            const empty = document.createElement('p');
+            empty.className = 'pool-empty';
+            empty.textContent = 'Пулы не настроены (embedding_pools.json).';
+            container.appendChild(empty);
+            return;
+        }
+
+        for (const pool of pools) {
+            const box = document.createElement('div');
+            box.className = 'pool';
+
+            const head = document.createElement('div');
+            head.className = 'pool-head';
+            const name = document.createElement('span');
+            name.className = 'pool-name';
+            name.textContent = pool.name;
+            head.appendChild(name);
+
+            const meta = document.createElement('span');
+            meta.className = 'pool-meta';
+            meta.textContent = String(pool.embedding_model) + ' · ' +
+                String(pool.dimensions) + 'd · healthy ' +
+                String(pool.members_healthy) + '/' + String(pool.members_total) +
+                ' · open breakers ' + String(pool.open_breakers);
+            head.appendChild(meta);
+
+            if (pool.enabled === false) {
+                const disabled = document.createElement('span');
+                disabled.className = 'pool-disabled';
+                disabled.textContent = 'disabled' + (pool.disabled_reason ? ' (' + pool.disabled_reason + ')' : '');
+                head.appendChild(disabled);
+            }
+            box.appendChild(head);
+
+            const memberForm = makePoolMemberForm(pool);
+            box.appendChild(makePoolActions(pool, memberForm));
+
+            const scroll = document.createElement('div');
+            scroll.className = 'table-scroll';
+            const table = document.createElement('table');
+            table.className = 'pool-table';
+            const thead = document.createElement('thead');
+            const headRow = document.createElement('tr');
+            for (const title of ['Backend', 'URL', 'Model', 'Role', 'Weight', 'Breaker',
+                                 'Failures', 'Requests/Failures', 'Last error', '']) {
+                const th = document.createElement('th');
+                th.textContent = title;
+                headRow.appendChild(th);
+            }
+            thead.appendChild(headRow);
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            for (const member of (pool.members || [])) {
+                tbody.appendChild(renderPoolMember(pool, member));
+            }
+            table.appendChild(tbody);
+            scroll.appendChild(table);
+            box.appendChild(scroll);
+
+            if (Array.isArray(pool.rejected) && pool.rejected.length) {
+                const list = document.createElement('ul');
+                list.className = 'pool-rejections';
+                for (const rejected of pool.rejected) {
+                    const item = document.createElement('li');
+                    item.textContent = 'отклонён ' + String(rejected.backend || '—') +
+                        ': ' + String(rejected.reason || 'unknown');
+                    list.appendChild(item);
+                }
+                box.appendChild(list);
+            }
+
+            box.appendChild(memberForm);
+            container.appendChild(box);
+        }
+    }
+
+    function makePoolActions(pool, memberForm) {
+        const actions = document.createElement('div');
+        actions.className = 'pool-actions';
+
+        const addBtn = document.createElement('button');
+        addBtn.className = 'secondary';
+        addBtn.textContent = 'Добавить участника';
+        addBtn.addEventListener('click', () => {
+            const show = memberForm.hidden;
+            memberForm.hidden = !show;
+            if (show) {
+                const used = new Set((pool.members || []).map((m) => m.backend));
+                const select = memberForm.querySelector('select');
+                const names = backendCatalog.map((b) => b.name).filter((n) => !used.has(n));
+                fillBackendSelect(select, names, 'Бэкенд');
+                memberForm.querySelector('input').focus();
+            }
+        });
+        actions.appendChild(addBtn);
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'secondary';
+        delBtn.textContent = 'Удалить пул';
+        delBtn.title = 'Удалить пул из embedding_pools.json';
+        delBtn.addEventListener('click', () => deletePool(pool.name));
+        actions.appendChild(delBtn);
+
+        return actions;
+    }
+
+    function makePoolMemberForm(pool) {
+        const form = document.createElement('form');
+        form.className = 'pool-form pool-member-form';
+        form.hidden = true;
+
+        const row = document.createElement('div');
+        row.className = 'pool-form-row';
+
+        const backendSelect = document.createElement('select');
+        fillBackendSelect(backendSelect, [], 'Бэкенд');
+        row.appendChild(backendSelect);
+
+        const modelInput = document.createElement('input');
+        modelInput.placeholder = 'Модель участника';
+        modelInput.setAttribute('list', 'pool-model-options');
+        row.appendChild(modelInput);
+
+        const weightInput = document.createElement('input');
+        weightInput.type = 'number';
+        weightInput.min = '1';
+        weightInput.value = '1';
+        weightInput.className = 'pool-small';
+        weightInput.title = 'Вес SWRR';
+        row.appendChild(weightInput);
+
+        const roleSelect = document.createElement('select');
+        for (const role of ['active', 'backup']) {
+            const option = document.createElement('option');
+            option.value = role;
+            option.textContent = role;
+            roleSelect.appendChild(option);
+        }
+        row.appendChild(roleSelect);
+        form.appendChild(row);
+
+        const actions = document.createElement('div');
+        actions.className = 'pool-form-actions';
+        const submit = document.createElement('button');
+        submit.type = 'submit';
+        submit.textContent = 'Добавить';
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.className = 'secondary';
+        cancel.textContent = 'Отмена';
+        cancel.addEventListener('click', () => { form.hidden = true; });
+        actions.appendChild(submit);
+        actions.appendChild(cancel);
+        form.appendChild(actions);
+
+        const err = document.createElement('p');
+        err.className = 'error';
+        err.hidden = true;
+        form.appendChild(err);
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            err.hidden = true;
+            const backend = backendSelect.value.trim();
+            const model = modelInput.value.trim();
+            if (!backend || !model) {
+                err.textContent = 'Выберите бэкенд и укажите модель';
+                err.hidden = false;
+                return;
+            }
+            const weight = parseInt(weightInput.value, 10) || 1;
+            const ok = await addPoolMember(pool.name, {
+                backend: backend,
+                model: model,
+                weight: weight,
+                role: roleSelect.value
+            }, err);
+            if (ok) {
+                form.hidden = true;
+            }
+        });
+        return form;
+    }
+
+    async function addPoolMember(poolName, payload, errEl) {
+        try {
+            const url = '/admin/api/embedding/pools/' + encodeURIComponent(poolName) + '/members';
+            const resp = await authRequest(url, { method: 'POST', body: payload });
+            if (!resp.ok) {
+                if (errEl) {
+                    errEl.textContent = await responseDetail(resp, 'Не удалось добавить участника');
+                    errEl.hidden = false;
+                }
+                return false;
+            }
+            showToast('Участник добавлен', 'success');
+            await loadPools(true);
+            return true;
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return false;
+            }
+            if (errEl) {
+                errEl.textContent = 'Ошибка при добавлении участника';
+                errEl.hidden = false;
+            }
+            return false;
+        }
+    }
+
+    async function removePoolMember(poolName, backend) {
+        if (!confirm('Удалить участника ' + backend + ' из пула ' + poolName + '?')) {
+            return;
+        }
+        try {
+            const url = '/admin/api/embedding/pools/' + encodeURIComponent(poolName) +
+                '/members/' + encodeURIComponent(backend);
+            const resp = await authRequest(url, { method: 'DELETE' });
+            if (!resp.ok) {
+                showToast(await responseDetail(resp, 'Не удалось удалить участника'), 'error');
+                return;
+            }
+            showToast('Участник удалён', 'success');
+            await loadPools(true);
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка при удалении участника', 'error');
+        }
+    }
+
+    async function deletePool(poolName) {
+        if (!confirm('Удалить пул ' + poolName + '? Все его участники будут удалены из конфига.')) {
+            return;
+        }
+        try {
+            const resp = await authRequest(
+                '/admin/api/embedding/pools/' + encodeURIComponent(poolName),
+                { method: 'DELETE' }
+            );
+            if (!resp.ok) {
+                showToast(await responseDetail(resp, 'Не удалось удалить пул'), 'error');
+                return;
+            }
+            showToast('Пул удалён', 'success');
+            await loadPools(true);
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка при удалении пула', 'error');
+        }
+    }
+
+    function togglePoolCreateForm(show) {
+        const form = $('pool-create-form');
+        if (!form) {
+            return;
+        }
+        const next = show === undefined ? form.hidden : !!show;
+        form.hidden = !next;
+        if (next) {
+            fillBackendSelect(
+                $('pool-new-backend'),
+                backendCatalog.map((b) => b.name),
+                'Первый участник: бэкенд (необязательно)'
+            );
+            $('pool-create-error').hidden = true;
+            $('pool-new-name').focus();
+        }
+    }
+
+    function resetPoolCreateForm() {
+        for (const id of ['pool-new-name', 'pool-new-model', 'pool-new-dims', 'pool-new-member-model']) {
+            const el = $(id);
+            if (el) {
+                el.value = '';
+            }
+        }
+        $('pool-new-weight').value = '1';
+        $('pool-new-role').value = 'active';
+        $('pool-create-error').hidden = true;
+        $('pool-create-form').hidden = true;
+    }
+
+    async function submitPoolCreate(event) {
+        event.preventDefault();
+        const errEl = $('pool-create-error');
+        errEl.hidden = true;
+        const name = $('pool-new-name').value.trim();
+        const model = $('pool-new-model').value.trim();
+        const dims = parseInt($('pool-new-dims').value, 10);
+        const backend = $('pool-new-backend').value.trim();
+        const memberModel = $('pool-new-member-model').value.trim();
+        const weight = parseInt($('pool-new-weight').value, 10) || 1;
+        const role = $('pool-new-role').value;
+
+        if (!NAME_RE.test(name)) {
+            errEl.textContent = 'Недопустимое имя пула: 1-63 символа, только [a-zA-Z0-9_-], без пробелов';
+            errEl.hidden = false;
+            return;
+        }
+        if (!model) {
+            errEl.textContent = 'Укажите embedding-модель пула';
+            errEl.hidden = false;
+            return;
+        }
+        if (!dims || dims < 1) {
+            errEl.textContent = 'Размерность должна быть положительным целым числом';
+            errEl.hidden = false;
+            return;
+        }
+        if (backend && !memberModel) {
+            errEl.textContent = 'Укажите модель для выбранного бэкенда или очистите бэкенд';
+            errEl.hidden = false;
+            return;
+        }
+
+        const members = backend
+            ? [{ backend: backend, model: memberModel, weight: weight, role: role }]
+            : [];
+
+        try {
+            const resp = await authRequest('/admin/api/embedding/pools', {
+                method: 'POST',
+                body: {
+                    name: name,
+                    embedding_model: model,
+                    dimensions: dims,
+                    members: members
+                }
+            });
+            if (!resp.ok) {
+                errEl.textContent = await responseDetail(resp, 'Не удалось создать пул');
+                errEl.hidden = false;
+                return;
+            }
+            showToast('Пул создан', 'success');
+            resetPoolCreateForm();
+            await loadPools(true);
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            errEl.textContent = 'Ошибка при создании пула';
+            errEl.hidden = false;
+        }
+    }
+
+    async function loadPools(force) {
+        if (document.hidden) {
+            return;
+        }
+        if (!force && poolFormActive()) {
+            return;
+        }
+        const errEl = $('pool-error');
+        try {
+            const resp = await authRequest('/admin/api/embedding/pools');
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            const data = await resp.json();
+            renderPools(data.pools || [], data);
+            errEl.hidden = true;
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            errEl.textContent = 'Не удалось загрузить embedding-пулы' +
+                (e && e.message ? ' (' + e.message + ')' : '');
+            errEl.hidden = false;
+        }
+    }
+
+    async function reloadPoolConfig() {
+        const btn = $('pool-reload-btn');
+        btn.disabled = true;
+        try {
+            const resp = await authRequest('/admin/api/embedding/pools/reload', { method: 'POST' });
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            const data = await resp.json();
+            if (data && data.last_load_error) {
+                showToast('Конфиг загружен с ошибкой: ' + data.last_load_error, 'warning');
+            } else {
+                showToast('Конфигурация пулов перезагружена', 'success');
+            }
+            await loadPools();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка перезагрузки пулов', 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function resetPoolMember(poolName, backend) {
+        if (!confirm('Сбросить breaker участника ' + backend + ' в пуле ' + poolName + '?')) {
+            return;
+        }
+        try {
+            const url = '/admin/api/embedding/pools/' + encodeURIComponent(poolName) +
+                '/members/' + encodeURIComponent(backend) + '/reset';
+            const resp = await authRequest(url, { method: 'POST' });
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            showToast('Breaker сброшен', 'success');
+            await loadPools();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка сброса breaker', 'error');
+        }
+    }
+
     function showToast(message, type) {
         const container = $('toast-container');
         const toast = document.createElement('div');
@@ -488,6 +1160,10 @@
             addBackend($('add-name').value, $('add-url').value);
         });
         $('refresh-btn').addEventListener('click', refreshCache);
+        $('pool-reload-btn').addEventListener('click', reloadPoolConfig);
+        $('pool-create-btn').addEventListener('click', () => togglePoolCreateForm());
+        $('pool-create-cancel').addEventListener('click', () => togglePoolCreateForm(false));
+        $('pool-create-form').addEventListener('submit', submitPoolCreate);
         $('logout-btn').addEventListener('click', logout);
     });
 })();

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,27 @@ DEFAULT_MAX_TOTAL_SECONDS = 90.0
 MIN_ATTEMPT_BUDGET_SECONDS = 2.0
 
 VALID_ROLES = ("active", "backup")
+POOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$")
+
+
+class PoolConfigError(ValueError):
+    """Invalid pool or member definition supplied to the admin API."""
+
+
+class PoolNotFoundError(PoolConfigError):
+    """The requested pool is not present in the configuration."""
+
+
+class PoolExistsError(PoolConfigError):
+    """A pool with the requested name already exists."""
+
+
+class MemberExistsError(PoolConfigError):
+    """The backend is already a member of the pool."""
+
+
+class MemberNotFoundError(PoolConfigError):
+    """The backend is not a member of the pool."""
 
 
 def default_client_factory(timeout: Any) -> httpx.AsyncClient:
@@ -147,6 +169,7 @@ class EmbeddingPoolManager:
         self.path = Path(path)
         self._client_factory = client_factory
         self._lock = asyncio.Lock()
+        self._config_lock = asyncio.Lock()
         self._pools: Dict[str, PoolConfig] = {}
         self._states: Dict[Tuple[str, str], MemberState] = {}
         self._defaults: Dict[str, float] = {
@@ -259,6 +282,307 @@ class EmbeddingPoolManager:
                 )
         logger.info("Embedding pools loaded: %s", ", ".join(pools) or "none")
         return True
+
+    # ------------------------------------------------------------------
+    # Configuration management (admin API)
+    # ------------------------------------------------------------------
+    def _read_raw_config(self, allow_missing: bool = False) -> Dict[str, Any]:
+        try:
+            data, _ = self._read_config()
+        except FileNotFoundError:
+            if not allow_missing:
+                raise
+            return {
+                "defaults": dict(self._defaults),
+                "default_pool": None,
+                "pools": {},
+            }
+        return data
+
+    def _write_raw_config(self, config: Dict[str, Any]) -> None:
+        """Atomic write with an in-place fallback for single-file bind mounts."""
+        data = json.dumps(config, indent=2, ensure_ascii=False)
+        tmp_file = self.path.with_name(self.path.name + ".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_file, self.path)
+        except OSError as exc:
+            # Single-file bind mount: rename over the mountpoint returns EBUSY.
+            logger.warning(
+                "Atomic write unavailable for %s: %s. Writing in place.", self.path, exc
+            )
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            with open(self.path, "w", encoding="utf-8") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    @staticmethod
+    def _validate_pool_name(name: Any) -> str:
+        value = str(name or "").strip()
+        if not POOL_NAME_RE.match(value):
+            raise PoolConfigError(
+                "Pool name must be 1-63 chars, start with alphanumeric/underscore, "
+                "and contain only [a-zA-Z0-9_-]"
+            )
+        return value
+
+    @staticmethod
+    def _normalize_member(member: Any) -> Dict[str, Any]:
+        if not isinstance(member, dict):
+            raise PoolConfigError("Member must be an object")
+        backend = str(member.get("backend", "")).strip()
+        model = str(member.get("model", "")).strip()
+        if not backend:
+            raise PoolConfigError("member.backend is required")
+        if not model:
+            raise PoolConfigError("member.model is required")
+        try:
+            weight = int(member.get("weight", 1))
+        except (TypeError, ValueError):
+            raise PoolConfigError("member.weight must be a positive integer") from None
+        if weight < 1:
+            raise PoolConfigError("member.weight must be a positive integer")
+        role = str(member.get("role", "active")).strip().lower() or "active"
+        if role not in VALID_ROLES:
+            raise PoolConfigError("member.role must be 'active' or 'backup'")
+        enabled = member.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise PoolConfigError("member.enabled must be true or false")
+        if not enabled:
+            raise PoolConfigError(
+                "member.enabled=false is not supported by the admin API; remove the member instead"
+            )
+        return {
+            "backend": backend,
+            "model": model,
+            "weight": weight,
+            "role": role,
+            "enabled": True,
+        }
+
+    def _find_raw_member(
+        self, entry: Dict[str, Any], backend: str
+    ) -> Optional[Dict[str, Any]]:
+        members = entry.get("members") or []
+        if not isinstance(members, list):
+            return None
+        for item in members:
+            if isinstance(item, dict) and str(item.get("backend", "")).strip() == backend:
+                return item
+        return None
+
+    async def _commit(
+        self,
+        raw: Dict[str, Any],
+        backends: Optional[Dict[str, str]],
+        pool_name: str,
+        expect_member: Optional[str] = None,
+        allow_empty: bool = False,
+    ) -> PoolConfig:
+        """Validate the mutated config, persist it and reload the manager."""
+        pools, _, _ = self._parse_config(raw, backends)
+        pool = pools.get(pool_name)
+        if pool is None:
+            raise PoolConfigError(f"Pool '{pool_name}' is invalid after the change")
+        if expect_member and pool.member(expect_member) is None:
+            reason = next(
+                (
+                    item.get("reason")
+                    for item in pool.rejected
+                    if item.get("backend") == expect_member
+                ),
+                "invalid_member",
+            )
+            raise PoolConfigError(f"member '{expect_member}' rejected: {reason}")
+        if not pool.members and not allow_empty:
+            raise PoolConfigError("Pool must have at least one valid member")
+        self._write_raw_config(raw)
+        await self.load(backends)
+        logger.info("Embedding pool config updated: %s", pool_name)
+        return pool
+
+    async def create_pool(
+        self,
+        name: Any,
+        embedding_model: Any,
+        dimensions: Any,
+        members: Any = None,
+        backends: Optional[Dict[str, str]] = None,
+    ) -> None:
+        pool_name = self._validate_pool_name(name)
+        model = str(embedding_model or "").strip()
+        if not model:
+            raise PoolConfigError("embedding_model is required")
+        try:
+            dims = int(dimensions)
+        except (TypeError, ValueError):
+            raise PoolConfigError("dimensions must be a positive integer") from None
+        if dims < 1:
+            raise PoolConfigError("dimensions must be a positive integer")
+        if members is None:
+            members = []
+        if not isinstance(members, list):
+            raise PoolConfigError("members must be a list")
+        normalized = [self._normalize_member(item) for item in members]
+        seen_backends = set()
+        for item in normalized:
+            if item["backend"] in seen_backends:
+                raise PoolConfigError(
+                    f"duplicate member backend '{item['backend']}'"
+                )
+            seen_backends.add(item["backend"])
+
+        async with self._config_lock:
+            raw = self._read_raw_config(allow_missing=True)
+            raw_pools = raw.setdefault("pools", {})
+            if not isinstance(raw_pools, dict):
+                raise PoolConfigError("'pools' must be an object")
+            if pool_name in raw_pools:
+                raise PoolExistsError(f"Pool '{pool_name}' already exists")
+            raw_pools[pool_name] = {
+                "embedding_model": model,
+                "dimensions": dims,
+                "members": normalized,
+            }
+            # Validate every requested member; _commit only checks one.
+            pools, _, _ = self._parse_config(raw, backends)
+            created = pools.get(pool_name)
+            if created is None:
+                raise PoolConfigError(f"Pool '{pool_name}' is invalid")
+            for item in normalized:
+                if created.member(item["backend"]) is None:
+                    reason = next(
+                        (
+                            rejected.get("reason")
+                            for rejected in created.rejected
+                            if rejected.get("backend") == item["backend"]
+                        ),
+                        "invalid_member",
+                    )
+                    raise PoolConfigError(
+                        f"member '{item['backend']}' rejected: {reason}"
+                    )
+            await self._commit(
+                raw,
+                backends,
+                pool_name,
+                allow_empty=not normalized,
+            )
+
+    async def delete_pool(
+        self, name: Any, backends: Optional[Dict[str, str]] = None
+    ) -> None:
+        pool_name = str(name or "").strip()
+        async with self._config_lock:
+            raw = self._read_raw_config()
+            raw_pools = raw.get("pools") or {}
+            if not isinstance(raw_pools, dict) or pool_name not in raw_pools:
+                raise PoolNotFoundError(f"Pool '{pool_name}' not found")
+            del raw_pools[pool_name]
+            if raw.get("default_pool") == pool_name:
+                raw["default_pool"] = None
+            self._write_raw_config(raw)
+            await self.load(backends)
+            logger.info("Embedding pool removed: %s", pool_name)
+
+    async def add_member(
+        self,
+        pool_name: Any,
+        member: Any,
+        backends: Optional[Dict[str, str]] = None,
+    ) -> None:
+        name = str(pool_name or "").strip()
+        normalized = self._normalize_member(member)
+        async with self._config_lock:
+            raw = self._read_raw_config()
+            raw_pools = raw.get("pools") or {}
+            entry = raw_pools.get(name) if isinstance(raw_pools, dict) else None
+            if not isinstance(entry, dict):
+                raise PoolNotFoundError(f"Pool '{name}' not found")
+            raw_members = entry.setdefault("members", [])
+            if not isinstance(raw_members, list):
+                raise PoolConfigError(f"Pool '{name}' has invalid 'members'")
+            if self._find_raw_member(entry, normalized["backend"]) is not None:
+                raise MemberExistsError(
+                    f"Backend '{normalized['backend']}' is already a member of pool '{name}'"
+                )
+            raw_members.append(normalized)
+            await self._commit(raw, backends, name, expect_member=normalized["backend"])
+
+    async def update_member(
+        self,
+        pool_name: Any,
+        backend: Any,
+        member: Any,
+        backends: Optional[Dict[str, str]] = None,
+    ) -> None:
+        name = str(pool_name or "").strip()
+        backend_name = str(backend or "").strip()
+        if not isinstance(member, dict):
+            raise PoolConfigError("Member must be an object")
+        async with self._config_lock:
+            raw = self._read_raw_config()
+            raw_pools = raw.get("pools") or {}
+            entry = raw_pools.get(name) if isinstance(raw_pools, dict) else None
+            if not isinstance(entry, dict):
+                raise PoolNotFoundError(f"Pool '{name}' not found")
+            existing = self._find_raw_member(entry, backend_name)
+            if existing is None:
+                raise MemberNotFoundError(
+                    f"Backend '{backend_name}' is not a member of pool '{name}'"
+                )
+            merged = dict(existing)
+            for key in ("model", "weight", "role", "enabled"):
+                if key in member:
+                    merged[key] = member[key]
+            merged["backend"] = backend_name
+            normalized = self._normalize_member(merged)
+            raw_members = entry.get("members") or []
+            entry["members"] = [
+                normalized
+                if isinstance(item, dict)
+                and str(item.get("backend", "")).strip() == backend_name
+                else item
+                for item in raw_members
+            ]
+            await self._commit(raw, backends, name, expect_member=backend_name)
+
+    async def remove_member(
+        self,
+        pool_name: Any,
+        backend: Any,
+        backends: Optional[Dict[str, str]] = None,
+    ) -> None:
+        name = str(pool_name or "").strip()
+        backend_name = str(backend or "").strip()
+        async with self._config_lock:
+            raw = self._read_raw_config()
+            raw_pools = raw.get("pools") or {}
+            entry = raw_pools.get(name) if isinstance(raw_pools, dict) else None
+            if not isinstance(entry, dict):
+                raise PoolNotFoundError(f"Pool '{name}' not found")
+            raw_members = entry.get("members") or []
+            remaining = [
+                item
+                for item in raw_members
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("backend", "")).strip() == backend_name
+                )
+            ]
+            if len(remaining) == len(raw_members):
+                raise MemberNotFoundError(
+                    f"Backend '{backend_name}' is not a member of pool '{name}'"
+                )
+            entry["members"] = remaining
+            await self._commit(raw, backends, name, allow_empty=True)
 
     async def maybe_reload(self, backends: Optional[Dict[str, str]] = None) -> bool:
         """Reload when the file mtime changed. Cheap enough per request."""

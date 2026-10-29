@@ -10,7 +10,9 @@ import importlib
 import inspect
 import json
 import os
+import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -606,3 +608,227 @@ def test_empty_model_without_default_pool_still_returns_400(tmp_path, monkeypatc
     with pytest.raises(HTTPException) as info:
         asyncio.run(router.route_embeddings(FakeRequest({"input": "hello"}), api_key="test"))
     assert info.value.status_code == 400
+
+
+# ----------------------------------------------------------------------
+# 10. Admin panel structure
+# ----------------------------------------------------------------------
+def test_admin_page_contains_pool_section(tmp_path, monkeypatch):
+    cfg = config([member("a")])
+    (tmp_path / "backends.json").write_text(json.dumps(BACKENDS), encoding="utf-8")
+    (tmp_path / "embedding_pools.json").write_text(json.dumps(cfg), encoding="utf-8")
+    templates_dir = tmp_path / "templates"
+    templates_dir.mkdir()
+    shutil.copy2(ROUTER_DIR / "templates" / "admin.html", templates_dir / "admin.html")
+
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("router", None)
+    router = importlib.import_module("router")
+
+    async def no_cache_update():
+        return None
+
+    router.update_models_cache = no_cache_update
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(router.app) as client:
+        response = client.get("/admin")
+
+    assert response.status_code == 200
+    assert 'id="pool-section"' in response.text
+    assert "/admin/api/embedding/pools" in response.text
+    assert 'id="pool-reload-btn"' in response.text
+
+
+# ----------------------------------------------------------------------
+# 11. Admin API: pool and member management
+# ----------------------------------------------------------------------
+@contextmanager
+def admin_client(tmp_path, monkeypatch, cfg=None):
+    cfg = cfg if cfg is not None else config([member("a")])
+    (tmp_path / "backends.json").write_text(json.dumps(BACKENDS), encoding="utf-8")
+    (tmp_path / "embedding_pools.json").write_text(json.dumps(cfg), encoding="utf-8")
+    templates_dir = tmp_path / "templates"
+    templates_dir.mkdir()
+    shutil.copy2(ROUTER_DIR / "templates" / "admin.html", templates_dir / "admin.html")
+
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("router", None)
+    router = importlib.import_module("router")
+    router.API_KEY = "test"
+
+    async def no_cache_update():
+        return None
+
+    async def empty_cache():
+        return {}
+
+    router.update_models_cache = no_cache_update
+    router.get_models_cache = empty_cache
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(router.app) as client:
+        yield router, client
+
+
+AUTH = {"Authorization": "Bearer test"}
+
+
+def pool_status(client, name):
+    response = client.get("/admin/api/embedding/pools", headers=AUTH)
+    assert response.status_code == 200
+    for pool in response.json()["pools"]:
+        if pool["name"] == name:
+            return pool
+    return None
+
+
+def test_admin_create_pool_then_add_member(tmp_path, monkeypatch):
+    with admin_client(tmp_path, monkeypatch) as (_router, client):
+        response = client.post(
+            "/admin/api/embedding/pools",
+            json={"name": "new-pool", "embedding_model": "test-embed", "dimensions": 4},
+            headers=AUTH,
+        )
+        assert response.status_code == 200, response.text
+
+        pool = pool_status(client, "new-pool")
+        assert pool is not None
+        assert pool["enabled"] is False
+        assert pool["disabled_reason"] == "no_valid_members"
+
+        response = client.post(
+            "/admin/api/embedding/pools/new-pool/members",
+            json=member("b", weight=2, role="backup"),
+            headers=AUTH,
+        )
+        assert response.status_code == 200, response.text
+
+        pool = pool_status(client, "new-pool")
+        assert pool["enabled"] is True
+        assert [m["backend"] for m in pool["members"]] == ["b"]
+        assert pool["members"][0]["weight"] == 2
+        assert pool["members"][0]["role"] == "backup"
+
+        saved = json.loads((tmp_path / "embedding_pools.json").read_text(encoding="utf-8"))
+        assert saved["pools"]["new-pool"]["members"][0]["backend"] == "b"
+
+
+def test_admin_create_pool_with_initial_member(tmp_path, monkeypatch):
+    with admin_client(tmp_path, monkeypatch) as (_router, client):
+        response = client.post(
+            "/admin/api/embedding/pools",
+            json={
+                "name": "embed-4",
+                "embedding_model": "test-embed",
+                "dimensions": 4,
+                "members": [member("a", weight=3)],
+            },
+            headers=AUTH,
+        )
+        assert response.status_code == 200, response.text
+        pool = pool_status(client, "embed-4")
+        assert pool["enabled"] is True
+        assert pool["members"][0]["backend"] == "a"
+        assert pool["members"][0]["weight"] == 3
+
+
+def test_admin_rejects_invalid_pool_and_member(tmp_path, monkeypatch):
+    with admin_client(tmp_path, monkeypatch) as (_router, client):
+        # Duplicate name.
+        response = client.post(
+            "/admin/api/embedding/pools",
+            json={"name": "p", "embedding_model": "test-embed", "dimensions": 4},
+            headers=AUTH,
+        )
+        assert response.status_code == 409
+
+        # Invalid name.
+        response = client.post(
+            "/admin/api/embedding/pools",
+            json={"name": "bad name", "embedding_model": "test-embed", "dimensions": 4},
+            headers=AUTH,
+        )
+        assert response.status_code == 400
+
+        # Duplicate backend inside a new pool.
+        response = client.post(
+            "/admin/api/embedding/pools",
+            json={
+                "name": "dup-pool",
+                "embedding_model": "test-embed",
+                "dimensions": 4,
+                "members": [member("a"), member("a", weight=2)],
+            },
+            headers=AUTH,
+        )
+        assert response.status_code == 400
+        assert "duplicate" in response.json()["detail"]
+
+        # Unknown backend.
+        response = client.post(
+            "/admin/api/embedding/pools/p/members",
+            json=member("unknown"),
+            headers=AUTH,
+        )
+        assert response.status_code == 400
+        assert "unknown_backend" in response.json()["detail"]
+
+        # Model mismatch.
+        response = client.post(
+            "/admin/api/embedding/pools/p/members",
+            json={"backend": "b", "model": "other-model"},
+            headers=AUTH,
+        )
+        assert response.status_code == 400
+        assert "model_mismatch" in response.json()["detail"]
+
+        # Duplicate member.
+        response = client.post(
+            "/admin/api/embedding/pools/p/members",
+            json=member("a"),
+            headers=AUTH,
+        )
+        assert response.status_code == 409
+
+
+def test_admin_update_and_remove_member_and_pool(tmp_path, monkeypatch):
+    with admin_client(tmp_path, monkeypatch) as (_router, client):
+        response = client.put(
+            "/admin/api/embedding/pools/p/members/a",
+            json={"weight": 5, "role": "backup"},
+            headers=AUTH,
+        )
+        assert response.status_code == 200, response.text
+        pool = pool_status(client, "p")
+        assert pool["members"][0]["weight"] == 5
+        assert pool["members"][0]["role"] == "backup"
+
+        response = client.delete(
+            "/admin/api/embedding/pools/p/members/a", headers=AUTH
+        )
+        assert response.status_code == 200, response.text
+        pool = pool_status(client, "p")
+        assert pool["members"] == []
+        assert pool["enabled"] is False
+
+        response = client.delete("/admin/api/embedding/pools/p", headers=AUTH)
+        assert response.status_code == 200, response.text
+        assert pool_status(client, "p") is None
+
+        response = client.delete("/admin/api/embedding/pools/p", headers=AUTH)
+        assert response.status_code == 404
+
+        saved = json.loads((tmp_path / "embedding_pools.json").read_text(encoding="utf-8"))
+        assert saved["pools"] == {}
+
+
+def test_admin_delete_default_pool_clears_reference(tmp_path, monkeypatch):
+    cfg = config([member("a")], default_pool="p")
+    with admin_client(tmp_path, monkeypatch, cfg) as (_router, client):
+        response = client.delete("/admin/api/embedding/pools/p", headers=AUTH)
+        assert response.status_code == 200, response.text
+        saved = json.loads((tmp_path / "embedding_pools.json").read_text(encoding="utf-8"))
+        assert saved["default_pool"] is None

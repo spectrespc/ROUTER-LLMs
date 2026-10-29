@@ -14,9 +14,16 @@ from contextlib import asynccontextmanager
 import logging
 import traceback
 
-from embedding_pool import EmbeddingPoolManager
+from embedding_pool import (
+    EmbeddingPoolManager,
+    MemberExistsError,
+    MemberNotFoundError,
+    PoolConfigError,
+    PoolExistsError,
+    PoolNotFoundError,
+)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -411,6 +418,158 @@ async def admin_embedding_pools_reload(api_key: str = Depends(verify_api_key)):
         "pools": embedding_pool_manager.list_pools(),
         "last_load_error": embedding_pool_manager.status(BACKENDS)["last_load_error"],
     }
+
+def _embedding_config_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (PoolExistsError, MemberExistsError)):
+        status = 409
+    elif isinstance(exc, (PoolNotFoundError, MemberNotFoundError)):
+        status = 404
+    elif isinstance(exc, PoolConfigError):
+        status = 400
+    else:
+        status = 500
+    return HTTPException(status_code=status, detail=str(exc))
+
+
+async def _read_admin_json(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return body
+
+
+@app.post("/admin/api/embedding/pools")
+async def admin_create_embedding_pool(
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """Создаёт пул (опционально с первым участником)."""
+    body = await _read_admin_json(request)
+    try:
+        await embedding_pool_manager.create_pool(
+            name=body.get("name"),
+            embedding_model=body.get("embedding_model"),
+            dimensions=body.get("dimensions"),
+            members=body.get("members") or [],
+            backends=BACKENDS,
+        )
+    except PoolConfigError as exc:
+        raise _embedding_config_http_error(exc) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail="embedding_pools.json not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write embedding_pools.json: {exc}",
+        ) from exc
+    logger.info(f"Embedding pool '{body.get('name')}' created via admin API.")
+    return {"status": "ok", "pools": embedding_pool_manager.list_pools()}
+
+
+@app.delete("/admin/api/embedding/pools/{pool}")
+async def admin_delete_embedding_pool(
+    pool: str,
+    api_key: str = Depends(verify_api_key),
+):
+    """Удаляет пул из embedding_pools.json."""
+    try:
+        await embedding_pool_manager.delete_pool(pool, backends=BACKENDS)
+    except PoolConfigError as exc:
+        raise _embedding_config_http_error(exc) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail="embedding_pools.json not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write embedding_pools.json: {exc}",
+        ) from exc
+    logger.info(f"Embedding pool '{pool}' deleted via admin API.")
+    return {"status": "ok", "pools": embedding_pool_manager.list_pools()}
+
+
+@app.post("/admin/api/embedding/pools/{pool}/members")
+async def admin_add_embedding_pool_member(
+    pool: str,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """Добавляет участника (backend + model) в пул."""
+    body = await _read_admin_json(request)
+    try:
+        await embedding_pool_manager.add_member(pool, body, backends=BACKENDS)
+    except PoolConfigError as exc:
+        raise _embedding_config_http_error(exc) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail="embedding_pools.json not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write embedding_pools.json: {exc}",
+        ) from exc
+    logger.info(f"Member '{body.get('backend')}' added to pool '{pool}' via admin API.")
+    return {"status": "ok", "pool": pool, "backend": body.get("backend")}
+
+
+@app.put("/admin/api/embedding/pools/{pool}/members/{backend}")
+async def admin_update_embedding_pool_member(
+    pool: str,
+    backend: str,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """Обновляет model/weight/role участника пула."""
+    body = await _read_admin_json(request)
+    try:
+        await embedding_pool_manager.update_member(
+            pool, backend, body, backends=BACKENDS
+        )
+    except PoolConfigError as exc:
+        raise _embedding_config_http_error(exc) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail="embedding_pools.json not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write embedding_pools.json: {exc}",
+        ) from exc
+    logger.info(f"Member '{backend}' of pool '{pool}' updated via admin API.")
+    return {"status": "ok", "pool": pool, "backend": backend}
+
+
+@app.delete("/admin/api/embedding/pools/{pool}/members/{backend}")
+async def admin_remove_embedding_pool_member(
+    pool: str,
+    backend: str,
+    api_key: str = Depends(verify_api_key),
+):
+    """Удаляет участника из пула."""
+    try:
+        await embedding_pool_manager.remove_member(pool, backend, backends=BACKENDS)
+    except PoolConfigError as exc:
+        raise _embedding_config_http_error(exc) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail="embedding_pools.json not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write embedding_pools.json: {exc}",
+        ) from exc
+    logger.info(f"Member '{backend}' removed from pool '{pool}' via admin API.")
+    return {"status": "ok", "pool": pool, "backend": backend}
+
 
 @app.post("/admin/api/embedding/pools/{pool}/members/{backend}/reset")
 async def admin_embedding_pool_reset(
