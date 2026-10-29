@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Router — Admin Panel</title>
+<style>
+    :root {
+        --bg: #1a1a2e;
+        --text: #e0e0e0;
+        --accent: #4fc3f7;
+        --error: #ef5350;
+        --success: #66bb6a;
+        --warning: #ffa726;
+        --online: #4caf50;
+        --offline: #f44336;
+        --row: #16213e;
+        --row-hover: #1a2744;
+        --input: #0f3460;
+        --border: #2a3a5e;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.5;
+    }
+
+    .wrap { max-width: 1200px; margin: 0 auto; }
+
+    h1 { font-size: 1.5rem; margin: 0; }
+    h2 { font-size: 1.15rem; margin: 0 0 12px; }
+
+    header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 24px;
+    }
+    header h1 { margin-right: auto; }
+
+    .card {
+        background: var(--row);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 24px;
+    }
+
+    button {
+        font: inherit;
+        color: #ffffff;
+        background: var(--accent);
+        border: none;
+        border-radius: 6px;
+        padding: 8px 16px;
+        cursor: pointer;
+        transition: filter .15s ease, opacity .15s ease;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.12); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button.secondary { background: #3a4a6e; }
+    button.remove-btn {
+        background: transparent;
+        color: var(--error);
+        font-size: 1.1rem;
+        line-height: 1;
+        padding: 4px 10px;
+        border: 1px solid transparent;
+    }
+    button.remove-btn:hover { border-color: var(--error); filter: none; }
+
+    input {
+        font: inherit;
+        color: var(--text);
+        background: var(--input);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 9px 12px;
+        outline: none;
+        transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    input::placeholder { color: #8a9ab8; }
+    input:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(79, 195, 247, .25);
+    }
+
+    #add-form { display: flex; flex-wrap: wrap; gap: 12px; }
+    #add-form input#add-name { flex: 1 1 220px; }
+    #add-form input#add-url { flex: 2 1 320px; }
+
+    #login-section {
+        max-width: 420px;
+        margin: 12vh auto;
+        text-align: center;
+    }
+    #login-section input { width: 100%; margin-bottom: 12px; }
+    #login-section button { width: 100%; }
+
+    .error { color: var(--error); margin: 10px 0 0; }
+
+    .table-scroll { overflow-x: auto; }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 640px;
+    }
+    th, td {
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+        word-break: break-word;
+    }
+    th { color: #9fb0d0; font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
+    tbody tr { background: var(--row); }
+    tbody tr:hover { background: var(--row-hover); }
+
+    .status { font-weight: 600; white-space: nowrap; }
+    .status.online { color: var(--online); }
+    .status.offline { color: var(--offline); }
+    .backend-error { color: var(--warning); font-size: .85rem; }
+
+    #backend-count { color: #9fb0d0; font-size: 1rem; font-weight: 400; }
+
+    #toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        z-index: 1000;
+    }
+    .toast {
+        min-width: 200px;
+        max-width: 360px;
+        padding: 12px 16px;
+        border-radius: 6px;
+        color: #ffffff;
+        background: #3a4a6e;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+        transform: translateX(120%);
+        opacity: 0;
+        transition: transform .25s ease, opacity .25s ease;
+    }
+    .toast.show { transform: translateX(0); opacity: 1; }
+    .toast-success { background: var(--success); }
+    .toast-error { background: var(--error); }
+    .toast-warning { background: var(--warning); }
+
+    @media (max-width: 600px) {
+        body { padding: 16px; }
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+    <div id="login-section" class="card">
+        <h1>LLM Router — Admin</h1>
+        <p>Введите API-ключ для доступа к панели управления.</p>
+        <input id="api-key-input" type="password" placeholder="API Key" autocomplete="current-password">
+        <button id="login-btn">Войти</button>
+        <p id="login-error" class="error" hidden>Неверный ключ</p>
+    </div>
+
+    <div id="admin-content" hidden>
+        <header>
+            <h1>LLM Router — Admin Panel</h1>
+            <button id="refresh-btn" class="secondary">🔄 Обновить кэш</button>
+            <button id="logout-btn" class="secondary">Выйти</button>
+        </header>
+
+        <section id="add-section" class="card">
+            <h2>Добавить бэкенд</h2>
+            <form id="add-form">
+                <input id="add-name" placeholder="Имя (напр. llama-coder-3)" required>
+                <input id="add-url" placeholder="URL (напр. http://host:8080)" required>
+                <button type="submit">Добавить</button>
+            </form>
+            <p id="add-error" class="error" hidden></p>
+        </section>
+
+        <section id="list-section" class="card">
+            <h2>Бэкенды <span id="backend-count"></span></h2>
+            <div class="table-scroll">
+                <table id="backends-table">
+                    <thead>
+                        <tr>
+                            <th>Имя</th>
+                            <th>URL</th>
+                            <th>Статус</th>
+                            <th>Моделей</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="backends-tbody"></tbody>
+                </table>
+            </div>
+            <p id="list-error" class="error" hidden></p>
+        </section>
+    </div>
+
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+(function () {
+    'use strict';
+
+    const $ = (id) => document.getElementById(id);
+    const NAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/;
+
+    let apiKey = localStorage.getItem('admin_api_key') || '';
+    let autoRefreshTimer = null;
+
+    async function authRequest(url, options) {
+        const opts = Object.assign({}, options);
+        opts.headers = Object.assign({}, opts.headers, {
+            'Authorization': 'Bearer ' + apiKey
+        });
+        if (opts.body !== undefined && typeof opts.body !== 'string') {
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(opts.body);
+        }
+        let resp;
+        try {
+            resp = await fetch(url, opts);
+        } catch (e) {
+            showToast('Сетевая ошибка', 'error');
+            throw e;
+        }
+        if (resp.status === 401) {
+            logout();
+            const err = new Error('Unauthorized');
+            err.unauthorized = true;
+            throw err;
+        }
+        return resp;
+    }
+
+    function isUnauthorized(e) {
+        return !!e && (e.unauthorized === true || e.message === 'Unauthorized');
+    }
+
+    async function login() {
+        const input = $('api-key-input');
+        const candidate = ((input && input.value) ? input.value : apiKey).trim();
+        if (!candidate) {
+            return;
+        }
+        apiKey = candidate;
+        try {
+            const resp = await authRequest('/admin/api/backends');
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            localStorage.setItem('admin_api_key', apiKey);
+            $('login-error').hidden = true;
+            $('login-section').hidden = true;
+            $('admin-content').hidden = false;
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+            }
+            autoRefreshTimer = setInterval(loadBackends, 30000);
+            await loadBackends();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                $('login-error').hidden = false;
+                return;
+            }
+            apiKey = '';
+            localStorage.removeItem('admin_api_key');
+            $('login-error').hidden = false;
+        }
+    }
+
+    function logout() {
+        apiKey = '';
+        localStorage.removeItem('admin_api_key');
+        if (autoRefreshTimer) {
+            clearInterval(autoRefreshTimer);
+            autoRefreshTimer = null;
+        }
+        const loginSection = $('login-section');
+        const adminContent = $('admin-content');
+        if (loginSection) loginSection.hidden = false;
+        if (adminContent) adminContent.hidden = true;
+        const tbody = $('backends-tbody');
+        if (tbody) tbody.replaceChildren();
+        const input = $('api-key-input');
+        if (input) input.value = '';
+    }
+
+    function makeCellText(text) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        return td;
+    }
+
+    function renderBackends(backends) {
+        const tbody = $('backends-tbody');
+        tbody.replaceChildren();
+        $('backend-count').textContent = '(' + backends.length + ')';
+
+        for (const b of backends) {
+            const tr = document.createElement('tr');
+
+            tr.appendChild(makeCellText(b.name));
+
+            const urlTd = document.createElement('td');
+            const urlText = String(b.url || '');
+            const urlSpan = document.createElement('span');
+            urlSpan.textContent = urlText.length > 50 ? urlText.slice(0, 47) + '...' : urlText;
+            urlSpan.title = urlText;
+            urlTd.appendChild(urlSpan);
+            tr.appendChild(urlTd);
+
+            const statusTd = document.createElement('td');
+            const online = b.status === 'online';
+            const dot = document.createElement('span');
+            dot.className = 'status ' + (online ? 'online' : 'offline');
+            dot.textContent = online ? '● online' : '● offline';
+            statusTd.appendChild(dot);
+            if (!online && b.error) {
+                const err = document.createElement('span');
+                err.className = 'backend-error';
+                err.textContent = ' ' + b.error;
+                statusTd.appendChild(err);
+            }
+            tr.appendChild(statusTd);
+
+            tr.appendChild(makeCellText(String(b.model_count != null ? b.model_count : 0)));
+
+            const actionTd = document.createElement('td');
+            const btn = document.createElement('button');
+            btn.className = 'remove-btn';
+            btn.textContent = '×';
+            btn.title = 'Удалить';
+            btn.addEventListener('click', () => removeBackend(b.name));
+            actionTd.appendChild(btn);
+            tr.appendChild(actionTd);
+
+            tbody.appendChild(tr);
+        }
+    }
+
+    async function loadBackends() {
+        const listError = $('list-error');
+        try {
+            const resp = await authRequest('/admin/api/backends');
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            const data = await resp.json();
+            renderBackends(data.backends || []);
+            listError.hidden = true;
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            listError.textContent = 'Не удалось загрузить список бэкендов';
+            listError.hidden = false;
+        }
+    }
+
+    async function addBackend(name, url) {
+        name = (name || '').trim();
+        url = (url || '').trim();
+        const errEl = $('add-error');
+        errEl.hidden = true;
+        errEl.textContent = '';
+        if (!name || !url) {
+            errEl.textContent = 'Имя и URL обязательны';
+            errEl.hidden = false;
+            return;
+        }
+        if (!NAME_RE.test(name)) {
+            errEl.textContent = 'Недопустимое имя: 1-63 символа, только [a-zA-Z0-9_-], без "@" и пробелов';
+            errEl.hidden = false;
+            return;
+        }
+        try {
+            const resp = await authRequest('/admin/api/backends', {
+                method: 'POST',
+                body: { name: name, url: url }
+            });
+            if (resp.status === 409) {
+                showToast('Бэкенд уже существует', 'error');
+                return;
+            }
+            if (resp.status === 400) {
+                let detail = 'Некорректные данные';
+                try {
+                    const d = await resp.json();
+                    if (d && d.detail) detail = d.detail;
+                } catch (e) { /* ignore */ }
+                errEl.textContent = detail;
+                errEl.hidden = false;
+                return;
+            }
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            showToast('Добавлен', 'success');
+            $('add-name').value = '';
+            $('add-url').value = '';
+            await loadBackends();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            errEl.textContent = 'Ошибка при добавлении бэкенда';
+            errEl.hidden = false;
+        }
+    }
+
+    async function removeBackend(name) {
+        if (!confirm('Удалить бэкенд ' + name + '?')) {
+            return;
+        }
+        try {
+            const resp = await authRequest('/admin/api/backends/' + encodeURIComponent(name), { method: 'DELETE' });
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            showToast('Удалён', 'success');
+            await loadBackends();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка при удалении', 'error');
+        }
+    }
+
+    async function refreshCache() {
+        try {
+            const resp = await authRequest('/admin/api/cache/refresh', { method: 'POST' });
+            if (!resp.ok) {
+                throw new Error('HTTP ' + resp.status);
+            }
+            showToast('Кэш обновлён', 'success');
+            await loadBackends();
+        } catch (e) {
+            if (isUnauthorized(e)) {
+                return;
+            }
+            showToast('Ошибка обновления кэша', 'error');
+        }
+    }
+
+    function showToast(message, type) {
+        const container = $('toast-container');
+        const toast = document.createElement('div');
+        toast.className = 'toast toast-' + (type || 'info');
+        toast.textContent = message;
+        container.appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add('show'));
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 300);
+        }, 3000);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        if (apiKey) {
+            login();
+        }
+        $('login-btn').addEventListener('click', login);
+        $('api-key-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                login();
+            }
+        });
+        $('add-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            addBackend($('add-name').value, $('add-url').value);
+        });
+        $('refresh-btn').addEventListener('click', refreshCache);
+        $('logout-btn').addEventListener('click', logout);
+    });
+})();
+</script>
+</body>
+</html>

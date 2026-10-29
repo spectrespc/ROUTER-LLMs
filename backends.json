@@ -1,0 +1,5 @@
+{
+  "small-function-writer": "http://192.168.52.68:8082",
+  "medium-function-writer": "http://192.168.52.68:8080",
+  "llama-embedded": "http://192.168.52.25:8002"
+}

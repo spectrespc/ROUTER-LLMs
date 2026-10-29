@@ -1,0 +1,35 @@
+{
+  "defaults": {
+    "failure_threshold": 3,
+    "cooldown_seconds": 30,
+    "attempt_timeout_seconds": 30,
+    "max_total_seconds": 90
+  },
+  "default_pool": null,
+  "pools": {
+    "embed-768": {
+      "embedding_model": "nomic-embed-text-v1.5",
+      "dimensions": 768,
+      "members": [
+        {
+          "backend": "llama-embedded",
+          "model": "nomic-embed-text-v1.5-Q8_0",
+          "weight": 3,
+          "role": "active"
+        },
+        {
+          "backend": "llama-embedded-2",
+          "model": "nomic-embed-text-v1.5-Q8_0",
+          "weight": 1,
+          "role": "active"
+        },
+        {
+          "backend": "llama-embedded-backup",
+          "model": "nomic-embed-text-v1.5-Q8_0",
+          "weight": 1,
+          "role": "backup"
+        }
+      ]
+    }
+  }
+}
